@@ -1,0 +1,78 @@
+/* static/css/style.css */
+body {
+    background-color: #f8f9fa;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+.navbar-brand {
+    font-weight: bold;
+}
+
+.hero-section {
+    padding: 3rem 0;
+}
+
+.feature {
+    text-align: center;
+    padding: 1.5rem;
+}
+
+.feature i {
+    color: #0d6efd;
+}
+
+.card {
+    box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.15);
+    border: none;
+    border-radius: 0.5rem;
+}
+
+.card-locked {
+    opacity: 0.7;
+}
+
+.stat-card {
+    padding: 1.5rem;
+    background-color: #f8f9fa;
+    border-radius: 0.5rem;
+}
+
+.stat-card h2 {
+    color: #0d6efd;
+    margin-bottom: 0.5rem;
+}
+
+.writing-area {
+    border: 2px dashed #dee2e6;
+    border-radius: 0.5rem;
+    padding: 1rem;
+    background-color: white;
+}
+
+#writingCanvas {
+    border: 1px solid #ced4da;
+    border-radius: 0.25rem;
+    background-color: white;
+    cursor: crosshair;
+    touch-action: none;
+}
+
+.btn {
+    border-radius: 0.25rem;
+}
+
+.display-1 {
+    font-size: 4rem;
+    font-weight: bold;
+}
+
+@media (max-width: 768px) {
+    .display-1 {
+        font-size: 3rem;
+    }
+    
+    #writingCanvas {
+        width: 100%;
+        height: 200px;
+    }
+}
