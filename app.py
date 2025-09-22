@@ -1,15 +1,17 @@
 # app.py
-from flask import Flask, render_template, request, redirect, url_for, session, jsonify
+from flask import Flask, render_template, request, redirect, url_for, session, jsonify, send_file
 from flask_bcrypt import Bcrypt
 import sqlite3
 import os
 import cv2
 import numpy as np
 import base64
-import io
-from PIL import Image
+from io import BytesIO
+from PIL import Image, ImageDraw, ImageFont
 import json
 from datetime import datetime
+import cv2.ximgproc as ximgproc
+import requests
 
 app = Flask(__name__)
 app.secret_key = 'your-secret-key-here'  # Change this in production
@@ -53,6 +55,7 @@ def init_db():
         attempts INTEGER DEFAULT 0,
         successful_attempts INTEGER DEFAULT 0,
         last_accuracy REAL DEFAULT 0,
+        highest_accuracy REAL DEFAULT 0,
         last_attempt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         completed BOOLEAN DEFAULT FALSE,
         FOREIGN KEY (user_id) REFERENCES users (id),
@@ -60,6 +63,12 @@ def init_db():
         UNIQUE(user_id, lesson_id)
     )
     ''')
+    
+    # Safely add the new column if it doesn't exist for current users
+    try:
+        cursor.execute('ALTER TABLE progress ADD COLUMN highest_accuracy REAL DEFAULT 0')
+    except sqlite3.OperationalError:
+        pass # Column already exists, do nothing
     
     # Insert default lessons if they don't exist
     cursor.execute("SELECT COUNT(*) FROM lessons")
@@ -80,7 +89,7 @@ def init_db():
                 ('mei', f'மெய் எழுத்து {i+1}', 'letter', letter, i + len(uyir_letters))
             )
         
-        # Uyir-Mei Eluthukal (க – ஹ)
+        # Uyir-Mei Eluthukal (க – ன)
         uyirmei_letters = ['க', 'ங', 'ச', 'ஞ', 'ட', 'ண', 'த', 'ந', 'ப', 'ம', 'ய', 'ர', 'ல', 'வ', 'ழ', 'ள', 'ற', 'ன']
         for i, letter in enumerate(uyirmei_letters):
             cursor.execute(
@@ -129,13 +138,11 @@ def init_db():
 
 init_db()
 
-# Helper function for database operations
 def get_db_connection():
     conn = sqlite3.connect('database.db')
     conn.row_factory = sqlite3.Row
     return conn
 
-# Authentication middleware
 def login_required(f):
     from functools import wraps
     @wraps(f)
@@ -145,7 +152,16 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
-# Routes
+@app.route('/tts')
+def tts():
+    text = request.args.get('text', '')
+    if not text:
+        return "No text provided", 400
+    url = f"https://translate.google.com/translate_tts?ie=UTF-8&q={text}&tl=ta&client=tw-ob"
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    r = requests.get(url, headers=headers)
+    return send_file(BytesIO(r.content), mimetype='audio/mpeg')
+
 @app.route('/')
 def index():
     if 'user_id' in session:
@@ -173,7 +189,6 @@ def signup():
             )
             conn.commit()
             
-            # Create empty progress records for all lessons
             cursor.execute("SELECT id FROM lessons")
             lessons = cursor.fetchall()
             user_id = cursor.lastrowid
@@ -183,7 +198,6 @@ def signup():
                     "INSERT INTO progress (user_id, lesson_id) VALUES (?, ?)",
                     (user_id, lesson['id'])
                 )
-            
             conn.commit()
             
             session['user_id'] = user_id
@@ -193,7 +207,6 @@ def signup():
             return render_template('signup.html', error='Username or email already exists')
         finally:
             conn.close()
-    
     return render_template('signup.html')
 
 @app.route('/login', methods=['GET', 'POST'])
@@ -203,9 +216,7 @@ def login():
         password = request.form['password']
         
         conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
-        user = cursor.fetchone()
+        user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
         conn.close()
         
         if user and bcrypt.check_password_hash(user['password'], password):
@@ -214,7 +225,6 @@ def login():
             return redirect(url_for('dashboard'))
         else:
             return render_template('login.html', error='Invalid username or password')
-    
     return render_template('login.html')
 
 @app.route('/logout')
@@ -226,209 +236,239 @@ def logout():
 @login_required
 def dashboard():
     conn = get_db_connection()
-    cursor = conn.cursor()
+    progress = conn.execute('''
+        SELECT 
+            COUNT(*) as total_lessons,
+            SUM(CASE WHEN completed = 1 THEN 1 ELSE 0 END) as completed_lessons,
+            AVG(CASE WHEN completed = 1 THEN highest_accuracy END) as avg_accuracy
+            FROM progress 
+            WHERE user_id = ?
+        ''', (session['user_id'],)).fetchone()
+
+    # Get difficult lessons
+    difficult_lessons = conn.execute('''
+        SELECT l.id, l.title, l.content, p.highest_accuracy
+        FROM lessons l
+        JOIN progress p ON l.id = p.lesson_id
+        WHERE p.user_id = ? AND p.attempts > 0 AND p.completed = 0
+        ORDER BY p.highest_accuracy ASC
+        LIMIT 3
+        ''', (session['user_id'],)).fetchall()
     
-    # Get user progress
-    cursor.execute('''
-    SELECT 
-        COUNT(*) as total_lessons,
-        SUM(CASE WHEN completed = 1 THEN 1 ELSE 0 END) as completed_lessons,
-        AVG(CASE WHEN completed = 1 THEN last_accuracy END) as avg_accuracy
-    FROM progress 
-    WHERE user_id = ?
-    ''', (session['user_id'],))
-    
-    progress = cursor.fetchone()
     conn.close()
     
-    total_lessons = progress['total_lessons'] or 0
-    completed_lessons = progress['completed_lessons'] or 0
-    avg_accuracy = round((progress['avg_accuracy'] or 0) * 100, 1)
-    
     return render_template('dashboard.html', 
-                         username=session['username'],
-                         total_lessons=total_lessons,
-                         completed_lessons=completed_lessons,
-                         avg_accuracy=avg_accuracy)
+                            username=session.get('username'),
+                            total_lessons=progress['total_lessons'] or 0,
+                            completed_lessons=progress['completed_lessons'] or 0,
+                            avg_accuracy=round((progress['avg_accuracy'] or 0) * 100, 1),
+                            difficult_lessons=difficult_lessons)
 
 @app.route('/lessons')
 @login_required
 def lessons():
     conn = get_db_connection()
-    cursor = conn.cursor()
+    lessons_data_rows = conn.execute('''
+        SELECT l.*, p.attempts, p.successful_attempts, p.last_accuracy, p.highest_accuracy, p.completed
+        FROM lessons l
+        LEFT JOIN progress p ON l.id = p.lesson_id AND p.user_id = ?
+        ORDER BY l.order_index
+    ''', (session['user_id'],)).fetchall()
     
-    # Get all lessons with user progress
-    cursor.execute('''
-    SELECT l.*, p.attempts, p.successful_attempts, p.last_accuracy, p.completed
-    FROM lessons l
-    LEFT JOIN progress p ON l.id = p.lesson_id AND p.user_id = ?
-    ORDER BY l.order_index
-    ''', (session['user_id'],))
-    
-    lessons_data = cursor.fetchall()
-    
+    lessons_data = [dict(row) for row in lessons_data_rows]
+
     # Calculate unlock status
-    lessons_with_status = []
-    for lesson in lessons_data:
-        lesson_dict = dict(lesson)
-        
-        # Check if previous lessons are completed enough to unlock this one
-        if lesson['order_index'] == 0:
-            lesson_dict['unlocked'] = True
+    # This logic now depends on highest_accuracy
+    for i, lesson in enumerate(lessons_data):
+        if lesson['unlock_threshold'] == 0:
+            lesson['unlocked'] = True
         else:
-            # Check unlock threshold
-            cursor.execute('''
-            SELECT AVG(last_accuracy) as prev_avg_accuracy
-            FROM progress p
-            JOIN lessons l ON p.lesson_id = l.id
-            WHERE p.user_id = ? AND l.order_index < ?
-            ''', (session['user_id'], lesson['order_index']))
-            
-            prev_avg = cursor.fetchone()['prev_avg_accuracy'] or 0
-            lesson_dict['unlocked'] = prev_avg * 100 >= lesson['unlock_threshold']
-        
-        lessons_with_status.append(lesson_dict)
+            # Check if all previous lessons are completed with sufficient accuracy
+            unlocked = True
+            for prev_lesson in lessons_data[:i]:
+                # A lesson must be completed to count towards unlocking the next one
+                if not prev_lesson['completed']:
+                    unlocked = False
+                    break
+            lesson['unlocked'] = unlocked
     
     conn.close()
-    
-    return render_template('lessons.html', lessons=lessons_with_status)
+    return render_template('lessons.html', lessons=lessons_data)
 
 @app.route('/lesson/<int:lesson_id>')
 @login_required
 def lesson_detail(lesson_id):
     conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # Get lesson details
-    cursor.execute('''
-    SELECT l.*, p.attempts, p.successful_attempts, p.last_accuracy, p.completed
-    FROM lessons l
-    LEFT JOIN progress p ON l.id = p.lesson_id AND p.user_id = ?
-    WHERE l.id = ?
-    ''', (session['user_id'], lesson_id))
-    
-    lesson = cursor.fetchone()
+    lesson = conn.execute('''
+        SELECT l.*, p.attempts, p.successful_attempts, p.last_accuracy, p.highest_accuracy, p.completed
+        FROM lessons l
+        LEFT JOIN progress p ON l.id = p.lesson_id AND p.user_id = ?
+        WHERE l.id = ?
+    ''', (session['user_id'], lesson_id)).fetchone()
     
     if not lesson:
         conn.close()
         return "Lesson not found", 404
     
-    # Check if lesson is unlocked
+    # Simplified unlock check for direct access
     if lesson['order_index'] > 0:
-        cursor.execute('''
-        SELECT AVG(last_accuracy) as prev_avg_accuracy
-        FROM progress p
-        JOIN lessons l ON p.lesson_id = l.id
-        WHERE p.user_id = ? AND l.order_index < ?
-        ''', (session['user_id'], lesson['order_index']))
+        prev_lesson_progress = conn.execute('''
+            SELECT p.completed FROM progress p
+            JOIN lessons l ON p.lesson_id = l.id
+            WHERE p.user_id = ? AND l.order_index < ?
+            ORDER BY l.order_index DESC
+        ''', (session['user_id'], lesson['order_index'])).fetchall()
         
-        prev_avg = cursor.fetchone()['prev_avg_accuracy'] or 0
-        if prev_avg * 100 < lesson['unlock_threshold']:
-            conn.close()
+        is_locked = any(not p['completed'] for p in prev_lesson_progress)
+        if is_locked and lesson['unlock_threshold'] > 0:
             return "Lesson is locked. Complete previous lessons first.", 403
-    
+
     if lesson['content_type'] == 'translation':
         content = json.loads(lesson['content'])
     else:
         content = lesson['content']
-    # Find the next lesson (by order_index)
-        cursor.execute('''
+    
+    next_lesson_row = conn.execute('''
         SELECT id FROM lessons
         WHERE order_index > ?
         ORDER BY order_index ASC
         LIMIT 1
-        ''', (lesson['order_index'],))
-
-        next_lesson_row = cursor.fetchone()
-        next_lesson_id = next_lesson_row['id'] if next_lesson_row else None
-
-    conn.close()
+    ''', (lesson['order_index'],)).fetchone()
+    next_lesson_id = next_lesson_row['id'] if next_lesson_row else None
     
-    return render_template('lesson.html', lesson=dict(lesson), content=content, next_lesson_id=next_lesson_id)
-
+    conn.close()
+    return render_template('lesson.html', lesson=lesson, content=content, next_lesson_id=next_lesson_id)
 
 @app.route('/api/submit_attempt/<int:lesson_id>', methods=['POST'])
 @login_required
 def submit_attempt(lesson_id):
+    conn = None
     try:
-        # Get the image data from the request
         data = request.get_json()
-        image_data = data['image'].split(',')[1]  # Remove the data:image/png;base64 part
+        image_data = data['image'].split(',')[1]
         
-        # Decode the base64 image
         image_bytes = base64.b64decode(image_data)
-        image = Image.open(io.BytesIO(image_bytes))
+        user_image = Image.open(BytesIO(image_bytes))
         
-        # Convert to OpenCV format
-        opencv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-        
-        # For now, we'll use a simple comparison approach
-        # In a real implementation, you would use a trained model or more sophisticated algorithm
-        
-        # Get the expected content for this lesson
         conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT content, content_type FROM lessons WHERE id = ?", (lesson_id,))
-        lesson = cursor.fetchone()
+        lesson = conn.execute("SELECT content, content_type FROM lessons WHERE id = ?", (lesson_id,)).fetchone()
         
+        if not lesson:
+            return jsonify({'success': False, 'error': 'Lesson not found'}), 404
+            
         expected_content = lesson['content']
         if lesson['content_type'] == 'translation':
             expected_content = json.loads(lesson['content'])['ta']
         
-        # Simple evaluation (placeholder for actual ML model)
-        # This is a very basic implementation - in production, use a proper Tamil OCR or handwriting recognition model
-        is_correct, accuracy = evaluate_drawing(opencv_image, expected_content)
+        is_correct, accuracy = evaluate_drawing(user_image, expected_content)
         
-        # Update user progress
-        cursor.execute('''
-        UPDATE progress 
-        SET attempts = attempts + 1,
-            successful_attempts = successful_attempts + ?,
-            last_accuracy = ?,
-            last_attempt = CURRENT_TIMESTAMP,
-            completed = CASE WHEN ? >= 0.8 THEN 1 ELSE completed END
-        WHERE user_id = ? AND lesson_id = ?
-        ''', (1 if is_correct else 0, accuracy, accuracy, session['user_id'], lesson_id))
+        accuracy_val = float(accuracy) / 100.0
+        
+        conn.execute('''
+            UPDATE progress 
+            SET attempts = attempts + 1,
+                successful_attempts = successful_attempts + ?,
+                last_accuracy = ?,
+                highest_accuracy = MAX(highest_accuracy, ?),
+                last_attempt = CURRENT_TIMESTAMP,
+                completed = CASE WHEN completed = 1 THEN 1 ELSE ? END
+            WHERE user_id = ? AND lesson_id = ?
+        ''', (1 if is_correct else 0, accuracy_val, accuracy_val, 1 if is_correct else 0, session['user_id'], lesson_id))
         
         conn.commit()
-        conn.close()
         
         feedback = "சரி! நீங்கள் சரியாக எழுதியுள்ளீர்கள்." if is_correct else "மீண்டும் முயற்சிக்கவும். உங்கள் எழுத்து சற்று வித்தியாசமாக உள்ளது."
         
         return jsonify({
             'success': True,
-            'correct': is_correct,
-            'accuracy': round(accuracy * 100, 1),
+            'correct': bool(is_correct),
+            'accuracy': float(accuracy),
             'feedback': feedback
         })
     
     except Exception as e:
+        import traceback
+        print(traceback.format_exc())
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': f"A server error occurred: {str(e)}"
         }), 500
+    finally:
+        if conn:
+            conn.close()
 
-def evaluate_drawing(image, expected_text):
+def evaluate_drawing(user_image, expected_text, font_path="static/fonts/NotoSansTamil-Regular.ttf", size=(600, 300)):
     """
-    Placeholder function for evaluating Tamil handwriting.
-    In a real implementation, this would use a proper Tamil OCR or handwriting recognition model.
-    
-    For this demo, we'll return a random accuracy score with a bias toward correctness
-    based on the complexity of the expected text.
+    Evaluates a user's drawing using a two-way check for a more robust and fair score.
+    1. Precision: Measures how close the user's strokes are to the template path.
+    2. Completeness: Measures if the user has drawn all parts of the template path.
     """
-    # Simple placeholder - in a real app, use a Tamil OCR library or ML model
-    import random
+    # --- 1. Preprocess the User's Drawing ---
+    user_img_np = np.array(user_image)
+    if user_img_np.shape[2] < 4: return False, 0.0
+    alpha_channel = user_img_np[:, :, 3]
+    _, user_bin = cv2.threshold(alpha_channel, 10, 255, cv2.THRESH_BINARY)
+    coords = cv2.findNonZero(user_bin)
+    if coords is None: return False, 0.0
+    x, y, w, h = cv2.boundingRect(coords)
+    user_bin_cropped = user_bin[y:y+h, x:x+w]
+    target_size = 256
+    square_canvas = np.zeros((target_size, target_size), dtype=np.uint8)
+    scale = 0.9 * target_size / max(w, h)
+    new_w, new_h = int(w * scale), int(h * scale)
+    resized_drawing = cv2.resize(user_bin_cropped, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    paste_x = (target_size - new_w) // 2
+    paste_y = (target_size - new_h) // 2
+    square_canvas[paste_y:paste_y+new_h, paste_x:paste_x+new_w] = resized_drawing
+    user_drawing_final = square_canvas
     
-    # More complex text gets lower accuracy on average
-    complexity_factor = min(1.0, 0.8 - (len(expected_text) * 0.05))
+    # --- 2. Create the Template and its Skeleton ---
+    template_img = Image.new("L", (target_size, target_size), 0)
+    draw = ImageDraw.Draw(template_img)
+    try:
+        font_size = int(target_size * 1.2)
+        font = ImageFont.truetype(font_path, font_size)
+        while font.getbbox(expected_text)[2] > target_size * 0.9 or font.getbbox(expected_text)[3] > target_size * 0.9:
+            font_size -= 2
+            font = ImageFont.truetype(font_path, font_size)
+    except IOError: font = ImageFont.load_default()
+    text_bbox = draw.textbbox((0, 0), expected_text, font=font)
+    text_width, text_height = text_bbox[2] - text_bbox[0], text_bbox[3] - text_bbox[1]
+    pos = ((target_size - text_width) // 2, (target_size - text_height) // 2 - text_bbox[1])
+    draw.text(pos, expected_text, fill=255, font=font)
+    template_bin = np.array(template_img)
+    template_skeleton = ximgproc.thinning(template_bin)
+
+    # --- 3. Two-Way Distance Calculation ---
+    template_dist_map = cv2.distanceTransform(cv2.bitwise_not(template_skeleton), cv2.DIST_L2, 3)
+    user_pixels = cv2.findNonZero(user_drawing_final)
+    if user_pixels is None: return False, 0.0
     
-    # Generate a "random" accuracy that's biased toward being correct for simple text
-    accuracy = max(0.3, min(1.0, random.normalvariate(complexity_factor, 0.2)))
+    total_precision_dist = sum(template_dist_map[y, x] for p in user_pixels for x, y in p)
+    avg_precision_dist = total_precision_dist / len(user_pixels)
+
+    user_dist_map = cv2.distanceTransform(cv2.bitwise_not(user_drawing_final), cv2.DIST_L2, 3)
+    template_pixels = cv2.findNonZero(template_skeleton)
+    if template_pixels is None: return False, 0.0
     
-    # Consider it correct if accuracy is above 70%
-    is_correct = accuracy >= 0.7
+    total_completeness_dist = sum(user_dist_map[y, x] for p in template_pixels for x, y in p)
+    avg_completeness_dist = total_completeness_dist / len(template_pixels)
     
-    return is_correct, accuracy
+    # --- 4. Combined Scoring ---
+    max_dist = 0.10 * target_size
+
+    precision_penalty = min(avg_precision_dist / max_dist, 1.0)
+    completeness_penalty = min(avg_completeness_dist / max_dist, 1.0)
+
+    precision_score = 1.0 - precision_penalty
+    completeness_score = 1.0 - completeness_penalty
+
+    final_score = np.sqrt(precision_score * completeness_score)
+    
+    accuracy_percent = round(final_score * 100, 1)
+    is_correct = accuracy_percent >= 50.0
+
+    return is_correct, accuracy_percent
 
 if __name__ == '__main__':
     app.run(debug=True)
