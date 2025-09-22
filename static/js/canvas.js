@@ -1,20 +1,26 @@
 // static/js/canvas.js
 class CanvasManager {
-    constructor(canvasId, resetBtnId, submitBtnId, feedbackAreaId, feedbackContentId, lessonId) {
+    // MODIFIED: Constructor accepts templateCanvasId
+    constructor(canvasId, templateCanvasId, resetBtnId, submitBtnId, feedbackAreaId, feedbackContentId, lessonId, templateText) {
         this.canvas = document.getElementById(canvasId);
         this.ctx = this.canvas.getContext('2d');
+        
+        // NEW: Handle the template canvas
+        this.templateCanvas = document.getElementById(templateCanvasId);
+        this.templateCtx = this.templateCanvas.getContext('2d');
+
         this.resetBtn = document.getElementById(resetBtnId);
         this.submitBtn = document.getElementById(submitBtnId);
         this.feedbackArea = document.getElementById(feedbackAreaId);
         this.feedbackContent = document.getElementById(feedbackContentId);
         this.lessonId = lessonId;
-        
+        this.templateText = templateText;
         this.isDrawing = false;
         this.lastX = 0;
         this.lastY = 0;
         
-        // Set canvas styles
-        this.ctx.lineWidth = 3;
+        // Set canvas styles for drawing canvas
+        this.ctx.lineWidth = 5; // A bit thicker for better detection
         this.ctx.lineCap = 'round';
         this.ctx.lineJoin = 'round';
         this.ctx.strokeStyle = '#000';
@@ -22,33 +28,64 @@ class CanvasManager {
         // Set up event listeners
         this.setupEventListeners();
         this.setupTouchEvents();
-        this.adjustCanvasSize();
         
-        // Handle window resize
+        // Adjust canvas sizes on load and resize
+        this.adjustCanvasSize();
         window.addEventListener('resize', () => this.adjustCanvasSize());
     }
     
     adjustCanvasSize() {
-        // Make canvas responsive
         const container = this.canvas.parentElement;
-        this.canvas.width = container.clientWidth - 40; // Account for padding
-        this.canvas.height = Math.min(300, window.innerHeight * 0.4);
+        const width = container.clientWidth;
+        // Make height proportional to width, but max 300px
+        const height = Math.min(300, width * 0.5); 
+        
+        container.style.height = `${height}px`;
+
+        // MODIFIED: Resize both canvases
+        this.canvas.width = width;
+        this.canvas.height = height;
+        this.templateCanvas.width = width;
+        this.templateCanvas.height = height;
+
+        // Re-apply drawing styles after resize
+        this.ctx.lineWidth = 5;
+        this.ctx.lineCap = 'round';
+        this.ctx.lineJoin = 'round';
+        this.ctx.strokeStyle = '#000';
+        
+        this.drawTemplate();
     }
     
     setupEventListeners() {
-        // Mouse events
+        // Events are attached to the top canvas (this.canvas)
         this.canvas.addEventListener('mousedown', (e) => this.startDrawing(e));
         this.canvas.addEventListener('mousemove', (e) => this.draw(e));
         this.canvas.addEventListener('mouseup', () => this.stopDrawing());
         this.canvas.addEventListener('mouseout', () => this.stopDrawing());
         
-        // Button events
         this.resetBtn.addEventListener('click', () => this.clearCanvas());
         this.submitBtn.addEventListener('click', () => this.submitDrawing());
     }
+
+    // MODIFIED: Draws on the template canvas now
+    drawTemplate() {
+        if (!this.templateText) return;
+        const ctx = this.templateCtx; // Use template context
+        ctx.clearRect(0, 0, this.templateCanvas.width, this.templateCanvas.height);
+
+        ctx.save();
+        ctx.globalAlpha = 0.2;
+        ctx.fillStyle = '#6c757d'; // A muted gray color
+        ctx.font = `bold ${Math.floor(this.templateCanvas.height * 0.7)}px "Noto Sans Tamil"`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(this.templateText, this.templateCanvas.width / 2, this.templateCanvas.height / 2);
+        ctx.restore();
+    }
     
     setupTouchEvents() {
-        // Touch events for mobile devices
+        // Touch events remain the same, they target the top canvas
         this.canvas.addEventListener('touchstart', (e) => {
             e.preventDefault();
             const touch = e.touches[0];
@@ -57,7 +94,7 @@ class CanvasManager {
                 clientY: touch.clientY
             });
             this.canvas.dispatchEvent(mouseEvent);
-        });
+        }, { passive: false });
         
         this.canvas.addEventListener('touchmove', (e) => {
             e.preventDefault();
@@ -67,13 +104,13 @@ class CanvasManager {
                 clientY: touch.clientY
             });
             this.canvas.dispatchEvent(mouseEvent);
-        });
+        }, { passive: false });
         
         this.canvas.addEventListener('touchend', (e) => {
             e.preventDefault();
             const mouseEvent = new MouseEvent('mouseup');
             this.canvas.dispatchEvent(mouseEvent);
-        });
+        }, { passive: false });
     }
     
     startDrawing(e) {
@@ -103,20 +140,19 @@ class CanvasManager {
         this.isDrawing = false;
     }
     
+    // MODIFIED: Only clears the user's drawing canvas
     clearCanvas() {
         this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
         this.hideFeedback();
     }
     
     submitDrawing() {
-        // Convert canvas to base64 image
+        // This correctly gets data ONLY from the user's drawing canvas
         const imageData = this.canvas.toDataURL('image/png');
         
-        // Show loading state
         this.submitBtn.disabled = true;
         this.submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i> Checking...';
         
-        // Send to server for evaluation
         fetch(`/api/submit_attempt/${this.lessonId}`, {
             method: 'POST',
             headers: {
@@ -124,7 +160,12 @@ class CanvasManager {
             },
             body: JSON.stringify({ image: imageData })
         })
-        .then(response => response.json())
+        .then(response => {
+            if (!response.ok) {
+                throw new Error(`Server responded with status: ${response.status}`);
+            }
+            return response.json();
+        })
         .then(data => {
             if (data.success) {
                 this.showFeedback(data.feedback, data.correct, data.accuracy);
@@ -133,15 +174,16 @@ class CanvasManager {
             }
         })
         .catch(error => {
-            this.showFeedback('Network error: ' + error.message, false);
+            this.showFeedback('An error occurred: ' + error.message, false);
         })
         .finally(() => {
-            // Reset button state
             this.submitBtn.disabled = false;
             this.submitBtn.innerHTML = '<i class="fas fa-check me-1"></i> Submit';
         });
     }
     
+    // In static/js/canvas.js
+
     showFeedback(message, isCorrect, accuracy = null) {
         this.feedbackContent.innerHTML = message;
         
@@ -152,12 +194,12 @@ class CanvasManager {
         }
         
         if (accuracy !== null) {
-            this.feedbackContent.innerHTML += `<br><small>Accuracy: ${accuracy}%</small>`;
+            // CHANGED: Format the number to one decimal place
+            const formattedAccuracy = accuracy.toFixed(1);
+            this.feedbackContent.innerHTML += `<br><small>Accuracy: ${formattedAccuracy}%</small>`;
         }
         
         this.feedbackArea.classList.remove('d-none');
-        
-        // Scroll to feedback
         this.feedbackArea.scrollIntoView({ behavior: 'smooth' });
     }
     
