@@ -35,3 +35,7 @@ A web-based application to help users learn Tamil writing interactively.
 - **Frontend:** HTML, Bootstrap 5, JavaScript  
 - **Database:** SQLite  
 - **Image Processing:** PIL, OpenCV (placeholder evaluation)
+
+## How to view the output
+- clone the project or Download the Zip file.
+- Run the python file (app.py)
